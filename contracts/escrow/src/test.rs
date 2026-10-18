@@ -190,6 +190,62 @@ fn init_rejects_a_second_call() {
 }
 
 #[test]
+fn init_rejects_arbiter_equal_to_depositor_or_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let depositor = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let neutral_arbiter = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Each failure happens on a fresh contract so we can also prove an
+    // invalid configuration does not consume the one-time init slot.
+    for conflicted_arbiter in [depositor.clone(), beneficiary.clone()] {
+        let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+        assert_eq!(
+            client.try_init(
+                &depositor,
+                &beneficiary,
+                &Some(conflicted_arbiter),
+                &token,
+                &AMOUNT,
+                &DEADLINE,
+            ),
+            Err(Ok(Error::EscrowArbiterNotNeutral))
+        );
+        assert_eq!(client.try_get(), Err(Ok(Error::NotInitialized)));
+
+        // A corrected, independent arbiter can still initialize the same
+        // contract; the failed attempt did not persist any agreement.
+        client.init(
+            &depositor,
+            &beneficiary,
+            &Some(neutral_arbiter.clone()),
+            &token,
+            &AMOUNT,
+            &DEADLINE,
+        );
+        assert_eq!(client.get().arbiter, Some(neutral_arbiter.clone()));
+    }
+}
+
+#[test]
+fn init_allows_no_arbiter_even_when_depositor_equals_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let party = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+
+    // Neutrality applies only when Some(arbiter) is requested. Existing
+    // no-arbitration and same-party agreements remain backward-compatible.
+    client.init(&party, &party, &None, &token, &AMOUNT, &DEADLINE);
+    let agreement = client.get();
+    assert_eq!(agreement.arbiter, None);
+    assert_eq!(agreement.depositor, agreement.beneficiary);
+}
+
+#[test]
 fn init_rejects_non_positive_amounts() {
     let env = TestEnv::at(START_TS).env().clone();
     env.mock_all_auths();

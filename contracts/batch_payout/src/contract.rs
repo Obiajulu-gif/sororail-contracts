@@ -20,6 +20,10 @@ impl BatchPayoutContract {
     /// The whole batch is validated and totalled **before** any money moves,
     /// so an invalid line is rejected without a partial payout ever being
     /// attempted.
+    ///
+    /// Paying the funder's own address is intentionally permitted. Such a
+    /// line counts toward the receipt total but transfers no net funds;
+    /// only transfers to this contract's own address are rejected.
     pub fn execute(
         env: Env,
         funder: Address,
@@ -60,6 +64,8 @@ impl BatchPayoutContract {
     ///
     /// The common payroll shape, and cheaper to submit than `execute`
     /// because the amount crosses the wire once rather than once per line.
+    /// The funder may appear among recipients, including more than once;
+    /// those self-payments count in the receipt but have no net balance effect.
     pub fn execute_equal(
         env: Env,
         funder: Address,

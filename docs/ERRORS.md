@@ -33,6 +33,7 @@ or renumbers a variant in `errors.rs`.
 | 24 | `EscrowNotDisputed` | escrow | `resolve` called on an escrow that is not in `Disputed`. |
 | 25 | `EscrowAlreadyDisputed` | escrow | `dispute` called on an escrow that is already disputed. |
 | 26 | `EscrowNotCancellable` | escrow | `cancel` called on an escrow that is not in `Created`. |
+| 27 | `EscrowArbiterNotNeutral` | escrow | `init` configured an arbiter equal to the depositor or beneficiary. |
 | 40 | `StreamNotFound` | stream | No stream exists for the given id. |
 | 41 | `StreamCancelled` | stream | The stream has already been cancelled. |
 | 42 | `StreamNotCancellable` | stream | `cancel` called on a stream created with `cancellable = false`. |

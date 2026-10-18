@@ -4,7 +4,10 @@ Escrow: funds held by the contract, released on a condition.
 
 One agreement per deployed instance. The depositor funds it; the funds then
 leave only by release to the beneficiary, refund to the depositor, or an
-arbiter's split after a dispute.
+arbiter's split after a dispute. When an arbiter is provided at initialization,
+it must differ from both the depositor and beneficiary; otherwise `init`
+returns `EscrowArbiterNotNeutral` (27). Without an arbiter, the original
+no-dispute behavior is preserved.
 
 ```text
 Created ──fund──▶ Funded ──release──▶ Released

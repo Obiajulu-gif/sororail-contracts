@@ -116,6 +116,42 @@ fn execute_pays_each_recipient_their_own_amount() {
 }
 
 #[test]
+fn execute_allows_funder_as_recipient_without_deducting_self_payments() {
+    let f = Fixture::new();
+    let contractor = Address::generate(&f.env);
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: f.funder.clone(),
+            amount: 70,
+        },
+        Payment {
+            to: contractor.clone(),
+            amount: 125,
+        },
+        Payment {
+            to: f.funder.clone(),
+            amount: 30,
+        },
+    ];
+
+    // A self-payment is an intentional no-op, but each line still contributes
+    // to the receipt's count and declared total for payroll reconciliation.
+    let expected = Receipt {
+        count: 3,
+        total: 225,
+    };
+    assert_eq!(f.client.preview(&batch), expected);
+    assert_eq!(
+        f.client.execute(&f.funder, &f.token.address, &batch),
+        expected
+    );
+    assert_eq!(f.token.balance(&contractor), 125);
+    assert_eq!(f.token.balance(&f.funder), MINT - 125);
+    assert_eq!(f.token.balance(&f.client.address), 0);
+}
+
+#[test]
 fn execute_rejects_an_empty_batch() {
     let f = Fixture::new();
     let empty: Vec<Payment> = Vec::new(&f.env);
@@ -383,6 +419,35 @@ fn execute_equal_pays_everyone_the_same() {
         assert_eq!(f.token.balance(&r), 200);
     }
     assert_eq!(f.token.balance(&f.funder), MINT - 1_000);
+}
+
+#[test]
+fn execute_equal_allows_funder_as_recipient_without_deducting_self_payments() {
+    let f = Fixture::new();
+    let contractor = Address::generate(&f.env);
+    let recipients = vec![
+        &f.env,
+        f.funder.clone(),
+        contractor.clone(),
+        f.funder.clone(),
+    ];
+
+    let receipt = f
+        .client
+        .execute_equal(&f.funder, &f.token.address, &recipients, &80);
+
+    // Three requested lines are counted even though the two funder-to-self
+    // transfers have no net effect on the funder's token balance.
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 240
+        }
+    );
+    assert_eq!(f.token.balance(&contractor), 80);
+    assert_eq!(f.token.balance(&f.funder), MINT - 80);
+    assert_eq!(f.token.balance(&f.client.address), 0);
 }
 
 #[test]

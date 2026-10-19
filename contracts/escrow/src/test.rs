@@ -1,12 +1,7 @@
 use soroban_sdk::{
     testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
- test/consolidate-contract-helpers-and-stable-ids
-    token::TokenClient,
-    Address, Env,
-
     token::{StellarAssetClient, TokenClient},
     Address, Env, Event,
- main
 };
 use sororail_common::{storage::INSTANCE_BUMP, testutils::TestEnv, Error};
 
@@ -49,8 +44,16 @@ impl Fixture<'_> {
     /// Builds an initialized escrow. `with_arbiter` controls whether the
     /// dispute path is available.
     fn new(with_arbiter: bool) -> Self {
+        Self::with_amount(with_arbiter, AMOUNT)
+    }
+
+    fn with_amount(with_arbiter: bool, amount: i128) -> Self {
         let te = TestEnv::at(START_TS);
-        let (token, depositor) = te.make_token(AMOUNT * 10);
+        let (token, depositor) = te.make_token(
+            amount
+                .checked_mul(10)
+                .expect("test token mint amount remains in range"),
+        );
         let token_address = token.address.clone();
         let beneficiary = te.make_address();
         let arbiter = te.make_address();
@@ -69,7 +72,7 @@ impl Fixture<'_> {
                 None
             },
             &token_address,
-            &AMOUNT,
+            &amount,
             &DEADLINE,
         );
 
@@ -86,6 +89,12 @@ impl Fixture<'_> {
 
     fn funded(with_arbiter: bool) -> Self {
         let f = Fixture::new(with_arbiter);
+        f.client.fund();
+        f
+    }
+
+    fn funded_amount(amount: i128) -> Self {
+        let f = Fixture::with_amount(true, amount);
         f.client.fund();
         f
     }
@@ -116,6 +125,57 @@ fn init_stores_the_agreement() {
 }
 
 #[test]
+fn get_returns_all_agreement_fields() {
+    let f = Fixture::new(true);
+    let e = f.client.get();
+    assert_eq!(e.depositor, f.depositor);
+    assert_eq!(e.beneficiary, f.beneficiary);
+    assert_eq!(e.arbiter, Some(f.arbiter.clone()));
+    assert_eq!(e.token, f.token.address);
+    assert_eq!(e.amount, AMOUNT);
+    assert_eq!(e.deadline, DEADLINE);
+    assert_eq!(e.state, State::Created);
+
+    // Without an arbiter, `None` round-trips too.
+    let g = Fixture::new(false);
+    let eg = g.client.get();
+    assert_eq!(eg.arbiter, None);
+    assert_eq!(eg.token, g.token.address);
+    assert_eq!(eg.amount, AMOUNT);
+    assert_eq!(eg.deadline, DEADLINE);
+}
+
+#[test]
+fn state_returns_each_variant_across_lifecycle() {
+    // Created -> Funded -> Released.
+    let f = Fixture::new(true);
+    assert_eq!(f.client.state(), State::Created);
+    f.client.fund();
+    assert_eq!(f.client.state(), State::Funded);
+    f.client.release(&f.depositor);
+    assert_eq!(f.client.state(), State::Released);
+
+    // Created -> Funded -> Refunded.
+    let g = Fixture::new(true);
+    assert_eq!(g.client.state(), State::Created);
+    g.client.fund();
+    assert_eq!(g.client.state(), State::Funded);
+    g.advance_past_deadline();
+    g.client.refund(&g.depositor);
+    assert_eq!(g.client.state(), State::Refunded);
+
+    // Created -> Funded -> Disputed -> Resolved.
+    let h = Fixture::new(true);
+    assert_eq!(h.client.state(), State::Created);
+    h.client.fund();
+    assert_eq!(h.client.state(), State::Funded);
+    h.client.dispute(&h.depositor);
+    assert_eq!(h.client.state(), State::Disputed);
+    h.client.resolve(&5_000);
+    assert_eq!(h.client.state(), State::Resolved);
+}
+
+#[test]
 fn init_rejects_a_second_call() {
     let f = Fixture::new(true);
     let res = f.client.try_init(
@@ -130,8 +190,64 @@ fn init_rejects_a_second_call() {
 }
 
 #[test]
+fn init_rejects_arbiter_equal_to_depositor_or_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let depositor = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let neutral_arbiter = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Each failure happens on a fresh contract so we can also prove an
+    // invalid configuration does not consume the one-time init slot.
+    for conflicted_arbiter in [depositor.clone(), beneficiary.clone()] {
+        let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+        assert_eq!(
+            client.try_init(
+                &depositor,
+                &beneficiary,
+                &Some(conflicted_arbiter),
+                &token,
+                &AMOUNT,
+                &DEADLINE,
+            ),
+            Err(Ok(Error::EscrowArbiterNotNeutral))
+        );
+        assert_eq!(client.try_get(), Err(Ok(Error::NotInitialized)));
+
+        // A corrected, independent arbiter can still initialize the same
+        // contract; the failed attempt did not persist any agreement.
+        client.init(
+            &depositor,
+            &beneficiary,
+            &Some(neutral_arbiter.clone()),
+            &token,
+            &AMOUNT,
+            &DEADLINE,
+        );
+        assert_eq!(client.get().arbiter, Some(neutral_arbiter.clone()));
+    }
+}
+
+#[test]
+fn init_allows_no_arbiter_even_when_depositor_equals_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let party = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+
+    // Neutrality applies only when Some(arbiter) is requested. Existing
+    // no-arbitration and same-party agreements remain backward-compatible.
+    client.init(&party, &party, &None, &token, &AMOUNT, &DEADLINE);
+    let agreement = client.get();
+    assert_eq!(agreement.arbiter, None);
+    assert_eq!(agreement.depositor, agreement.beneficiary);
+}
+
+#[test]
 fn init_rejects_non_positive_amounts() {
-    let env = TestEnv::at(START_TS).env;
+    let env = TestEnv::at(START_TS).env().clone();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START_TS);
     let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
@@ -151,7 +267,7 @@ fn init_rejects_non_positive_amounts() {
 
 #[test]
 fn init_rejects_a_deadline_that_is_not_in_the_future() {
-    let env = TestEnv::at(START_TS).env;
+    let env = TestEnv::at(START_TS).env().clone();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START_TS);
     let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
@@ -172,7 +288,7 @@ fn init_rejects_a_deadline_that_is_not_in_the_future() {
 
 #[test]
 fn entry_points_error_before_init() {
-    let env = TestEnv::new().env;
+    let env = TestEnv::new().env().clone();
     env.mock_all_auths();
     let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
     let who = Address::generate(&env);
@@ -488,6 +604,22 @@ fn release_rejects_a_closed_escrow() {
     );
 }
 
+/// `release` must reject a disputed escrow with `EscrowNotFunded`: the
+/// arbiter owns the outcome once a dispute is open, so the beneficiary
+/// cannot be paid out from under it. The balance must stay in the contract.
+#[test]
+fn release_rejects_a_disputed_escrow() {
+    let f = Fixture::funded(true);
+    f.client.dispute(&f.depositor);
+    assert_eq!(
+        f.client.try_release(&f.arbiter),
+        Err(Ok(Error::EscrowNotFunded))
+    );
+    assert_eq!(f.client.state(), State::Disputed);
+    assert_eq!(f.escrow_balance(), AMOUNT);
+    assert_eq!(f.token.balance(&f.beneficiary), 0);
+}
+
 // ---------------------------------------------------------------- refund
 
 #[test]
@@ -538,6 +670,28 @@ fn refund_by_arbiter_is_allowed_before_the_deadline() {
     f.client.refund(&f.arbiter);
     assert_eq!(f.escrow_balance(), 0);
     assert_eq!(f.client.state(), State::Refunded);
+}
+
+#[test]
+fn refund_moves_the_funded_tokens_back_to_the_depositor() {
+    // The other refund tests check `escrow_balance()` and `state()` but
+    // never that the depositor's own balance actually went back up -- a
+    // regression that zeroed the escrow without paying anyone would still
+    // pass those (#256). Covers both callers the funds can move under:
+    // the depositor themselves (after the deadline) and the arbiter (at
+    // any time).
+    let f = Fixture::funded(true);
+    let depositor_before = f.token.balance(&f.depositor);
+    f.advance_past_deadline();
+    f.client.refund(&f.depositor);
+    assert_eq!(f.token.balance(&f.depositor), depositor_before + AMOUNT);
+    assert_eq!(f.escrow_balance(), 0);
+
+    let g = Fixture::funded(true);
+    let depositor_before = g.token.balance(&g.depositor);
+    g.client.refund(&g.arbiter);
+    assert_eq!(g.token.balance(&g.depositor), depositor_before + AMOUNT);
+    assert_eq!(g.escrow_balance(), 0);
 }
 
 #[test]
@@ -617,6 +771,19 @@ fn dispute_requires_funding_first() {
     assert_eq!(
         f.client.try_dispute(&f.depositor),
         Err(Ok(Error::EscrowNotFunded))
+    );
+}
+
+#[test]
+fn dispute_rejects_an_already_released_escrow() {
+    // `release` is terminal, so `require_funded` must reject it with
+    // `EscrowClosed` rather than `EscrowNotFunded` -- a released escrow is
+    // closed, not simply never-funded (#257).
+    let f = Fixture::funded(true);
+    f.client.release(&f.depositor);
+    assert_eq!(
+        f.client.try_dispute(&f.depositor),
+        Err(Ok(Error::EscrowClosed))
     );
 }
 
@@ -709,6 +876,45 @@ fn resolve_rejects_basis_points_above_the_maximum() {
 }
 
 #[test]
+fn resolve_rejects_a_split_whose_product_overflows_at_the_max_amount() {
+    // `split_bps` multiplies `amount * bps` in i128 before dividing, so an
+    // escrow holding exactly i128::MAX can only be resolved at 0 or 1 bps;
+    // 2 bps is the first split whose intermediate product overflows. (The
+    // shared `Fixture` mints `amount * 10`, which cannot be built at MAX.)
+    let te = TestEnv::at(START_TS);
+    let (token, depositor) = te.make_token(i128::MAX);
+    let token_address = token.address.clone();
+    let beneficiary = te.make_address();
+    let arbiter = te.make_address();
+    let env = te.env().clone();
+    let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+    client.init(
+        &depositor,
+        &beneficiary,
+        &Some(arbiter),
+        &token_address,
+        &i128::MAX,
+        &DEADLINE,
+    );
+    client.fund();
+    client.dispute(&depositor);
+
+    assert_eq!(client.try_resolve(&2), Err(Ok(Error::Overflow)));
+    // The failed call changed nothing.
+    assert_eq!(client.state(), State::Disputed);
+    assert_eq!(token.balance(&client.address), i128::MAX);
+
+    // 1 bps is the largest split that still resolves, and it conserves the
+    // full amount exactly.
+    client.resolve(&1);
+    let to_beneficiary = i128::MAX / 10_000;
+    assert_eq!(token.balance(&beneficiary), to_beneficiary);
+    assert_eq!(token.balance(&depositor), i128::MAX - to_beneficiary);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.state(), State::Resolved);
+}
+
+#[test]
 fn resolve_endpoints_pay_one_side_in_full() {
     let f = Fixture::funded(true);
     f.client.dispute(&f.depositor);
@@ -743,6 +949,45 @@ fn resolve_conserves_the_escrowed_amount_at_every_split() {
         );
         assert_eq!(f.escrow_balance(), 0, "{bps}bps split stranded funds");
         assert!(to_beneficiary >= 0 && to_depositor >= 0);
+    }
+}
+
+mod resolve_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn resolve_conserves_amount_for_any_split(
+            amount in 1i128..=1_000_000_000_000,
+            bps in 0u32..=10_000,
+        ) {
+            let f = Fixture::funded_amount(amount);
+            let depositor_before = f.token.balance(&f.depositor);
+            f.client.dispute(&f.depositor);
+            f.client.resolve(&bps);
+
+            let paid_to_beneficiary = f.token.balance(&f.beneficiary);
+            let paid_to_depositor = f
+                .token
+                .balance(&f.depositor)
+                .checked_sub(depositor_before)
+                .expect("depositor balance delta remains in range");
+            let total_paid = paid_to_beneficiary
+                .checked_add(paid_to_depositor)
+                .expect("total paid remains in range");
+            prop_assert_eq!(
+                total_paid,
+                amount,
+                "amount {}, split {}bps",
+                amount,
+                bps
+            );
+            prop_assert_eq!(f.escrow_balance(), 0, "resolved escrow retained funds");
+        }
     }
 }
 

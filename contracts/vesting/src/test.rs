@@ -31,6 +31,18 @@ fn bump_restores_the_instance_ttl_after_ledger_advance() {
     });
 }
 
+#[test]
+fn bump_extends_the_instance_ttl() {
+    let f = Fixture::new(true);
+    f.env.as_contract(&f.client.address, || {
+        assert!(f.env.storage().instance().get_ttl() <= INSTANCE_BUMP);
+    });
+    f.client.bump();
+    f.env.as_contract(&f.client.address, || {
+        assert_eq!(f.env.storage().instance().get_ttl(), INSTANCE_BUMP);
+    });
+}
+
 const TOTAL: i128 = 1_000_000;
 const START: u64 = 1_000_000;
 const CLIFF: u64 = 100;
@@ -141,6 +153,39 @@ fn the_cliff_vests_the_elapsed_proportion_in_one_step() {
     assert_eq!(g.vested_amount(START + CLIFF), Ok(TOTAL / 10));
 }
 
+/// Issue #222: the cliff timestamp is **inclusive** — `vested_amount` at
+/// exactly `start + cliff` must return a non-zero amount equal to the
+/// elapsed proportion, and the second immediately before must return zero.
+/// This pins the boundary documented in `docs/vesting-safe-range.md` and
+/// in `Grant::vested_amount`: "Nothing vests before `start + cliff`; at
+/// that moment the elapsed proportion vests in one step."
+#[test]
+fn vested_amount_at_exact_cliff_is_inclusive_and_nonzero() {
+    let env = Env::default();
+    let g = bare(&env, CLIFF, DURATION);
+    let cliff_at = g.cliff_at(); // == START + CLIFF
+
+    // One second before the cliff: nothing vested.
+    assert_eq!(
+        g.vested_amount(cliff_at - 1),
+        Ok(0),
+        "one second before cliff must vest nothing"
+    );
+    // Exactly at the cliff: the elapsed proportion vests (cliff is inclusive).
+    // elapsed = CLIFF (100), duration = DURATION (1000) → 100/1000 of TOTAL.
+    let expected = TOTAL * i128::from(CLIFF) / i128::from(DURATION);
+    assert_eq!(
+        g.vested_amount(cliff_at),
+        Ok(expected),
+        "exact cliff timestamp must be inclusive and vest the elapsed proportion"
+    );
+    // One second after the cliff: slightly more has vested (linear increase).
+    assert!(
+        g.vested_amount(cliff_at + 1).unwrap() > expected,
+        "one second after cliff must vest more than at the cliff"
+    );
+}
+
 #[test]
 fn vesting_is_linear_after_the_cliff() {
     let env = Env::default();
@@ -172,7 +217,7 @@ fn a_zero_cliff_vests_linearly_from_the_start() {
     let env = Env::default();
     let g = bare(&env, 0, DURATION);
     assert_eq!(g.vested_amount(START), Ok(0));
-    assert_eq!(g.vested_amount(START + 1), Ok(TOTAL / DURATION as i128));
+    assert_eq!(g.vested_amount(START + 1), Ok(TOTAL / i128::from(DURATION)));
     assert_eq!(g.vested_amount(START + 500), Ok(TOTAL / 2));
 }
 
@@ -330,20 +375,26 @@ fn schedule_lists_start_cliff_and_end_for_a_cliffed_grant() {
     let f = Fixture::new(true);
     assert_eq!(
         checkpoints(&f),
-        vec![(START, 0), (START + 100, 100_000), (START + 1_000, TOTAL)]
+        std::vec![(START, 0), (START + 100, 100_000), (START + 1_000, TOTAL)]
     );
 }
 
 #[test]
 fn schedule_with_no_cliff_is_start_and_end() {
     let f = Fixture::with_schedule(true, 0, DURATION);
-    assert_eq!(checkpoints(&f), vec![(START, 0), (START + DURATION, TOTAL)]);
+    assert_eq!(
+        checkpoints(&f),
+        std::vec![(START, 0), (START + DURATION, TOTAL)]
+    );
 }
 
 #[test]
 fn schedule_with_cliff_equal_to_duration_is_start_and_end() {
     let f = Fixture::with_schedule(true, DURATION, DURATION);
-    assert_eq!(checkpoints(&f), vec![(START, 0), (START + DURATION, TOTAL)]);
+    assert_eq!(
+        checkpoints(&f),
+        std::vec![(START, 0), (START + DURATION, TOTAL)]
+    );
 }
 
 #[test]
@@ -502,6 +553,31 @@ fn create_rejects_a_second_call() {
     );
 }
 
+/// Issue #228: a second `create` is rejected with `AlreadyInitialized` and
+/// must leave the original grant untouched (no field is overwritten and the
+/// held balance is unchanged).
+#[test]
+fn second_create_is_rejected_and_leaves_the_grant_intact() {
+    let f = Fixture::new(true);
+    let before = f.client.get();
+    assert_eq!(
+        f.client.try_create(
+            &f.grantor,
+            &f.beneficiary,
+            &f.token.address,
+            &(TOTAL * 2),
+            &START,
+            &CLIFF,
+            &DURATION,
+            &false,
+        ),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+    assert_eq!(f.client.get(), before);
+    assert_eq!(f.held(), TOTAL);
+    f.assert_conserved();
+}
+
 #[test]
 fn create_rejects_identical_grantor_and_beneficiary() {
     let env = Env::default();
@@ -644,11 +720,7 @@ fn create_reverts_cleanly_when_grantor_cannot_fund() {
     let (token_client, grantor) = te.make_token(1);
     let token = token_client.address.clone();
     let beneficiary = te.make_address();
- test/consolidate-contract-helpers-and-stable-ids
     let env = te.env().clone();
-
-    let env = te.env.clone();
- main
     let c = VestingContractClient::new(&env, &env.register(VestingContract, ()));
 
     assert!(c
@@ -677,11 +749,7 @@ fn create_emits_the_created_event() {
     let (token_client, grantor) = te.make_token(MINT);
     let token_address = token_client.address.clone();
     let beneficiary = te.make_address();
- test/consolidate-contract-helpers-and-stable-ids
     let env = te.env().clone();
-
-    let env = te.env.clone();
- main
 
     let client = VestingContractClient::new(&env, &env.register(VestingContract, ()));
     client.create(
@@ -740,6 +808,16 @@ fn entry_points_error_before_create() {
     assert_eq!(c.try_claimable(), Err(Ok(Error::NotInitialized)));
     assert_eq!(c.try_remaining(), Err(Ok(Error::NotInitialized)));
     assert_eq!(c.try_vested_amount(&START), Err(Ok(Error::NotInitialized)));
+}
+
+/// Issue #227: `get` on a contract that has not run `create` yet must return
+/// `NotInitialized` rather than panicking or returning a zeroed grant.
+#[test]
+fn get_errors_before_create() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let c = VestingContractClient::new(&env, &env.register(VestingContract, ()));
+    assert_eq!(c.try_get(), Err(Ok(Error::NotInitialized)));
 }
 
 #[test]
@@ -851,11 +929,43 @@ fn claim_after_the_end_takes_everything() {
     f.assert_conserved();
 }
 
+/// #216 – After the end date the full remaining amount is claimable and
+/// `grant.claimed` reaches `grant.total`.
+#[test]
+fn claim_after_end_date_claimed_field_reaches_total() {
+    let f = Fixture::new(true);
+    f.at(START + DURATION + 1);
+    let claimable = f.client.claimable();
+    assert_eq!(claimable, TOTAL, "full amount must be claimable after end");
+    let returned = f.client.claim();
+    assert_eq!(returned, TOTAL, "claim must return the full total");
+    let grant = f.client.get();
+    assert_eq!(
+        grant.claimed, grant.total,
+        "claimed field must equal total after claiming everything"
+    );
+    f.assert_conserved();
+}
+
 #[test]
 #[should_panic]
 fn claim_requires_the_beneficiarys_authorization() {
     let f = Fixture::new(true);
     f.at(START + 500);
+    f.env.set_auths(&[]);
+    f.client.claim();
+}
+
+/// #218 – A non-beneficiary caller is rejected; only the beneficiary may claim.
+///
+/// Strips all authorisations so no address can satisfy `require_auth`.
+/// Soroban panics on a failed `require_auth`, which `should_panic` catches.
+#[test]
+#[should_panic]
+fn claim_is_callable_only_by_the_beneficiary() {
+    let f = Fixture::new(true);
+    f.at(START + 500);
+    // Remove all auth so neither beneficiary nor anyone else is authorised.
     f.env.set_auths(&[]);
     f.client.claim();
 }
@@ -955,6 +1065,55 @@ fn revoke_rejects_a_second_call() {
     assert_eq!(f.client.try_revoke(), Err(Ok(Error::VestingRevoked)));
 }
 
+/// Issue #221: a second revoke must return `VestingRevoked` regardless of
+/// how much time passes between the two calls.
+#[test]
+fn revoke_twice_is_rejected_with_already_revoked_error() {
+    let f = Fixture::new(true);
+    f.at(START + 300);
+    f.client.revoke();
+    // Advance time past the end of the schedule and try again.
+    f.at(START + DURATION + 1_000);
+    assert_eq!(
+        f.client.try_revoke(),
+        Err(Ok(Error::VestingRevoked)),
+        "second revoke must return VestingRevoked"
+    );
+}
+
+/// Issue #220: after a revoke the beneficiary can only claim the vested
+/// portion; a claim that would exceed the vested amount errors and no
+/// tokens are transferred.
+#[test]
+fn claim_after_revoke_only_pays_the_vested_portion_and_no_more() {
+    let f = Fixture::new(true);
+    // Revoke at 30 % through the schedule — 300 000 tokens are vested,
+    // 700 000 are returned to the grantor.
+    f.at(START + 300);
+    let grantor_before = f.token.balance(&f.grantor);
+    f.client.revoke();
+    assert_eq!(f.token.balance(&f.grantor), grantor_before + TOTAL * 7 / 10);
+
+    // Advance time well past the end — the frozen vested amount is still
+    // 300 000; no additional tokens are accrued after revocation.
+    f.at(START + DURATION + 10_000);
+
+    // Claim the vested portion — this must succeed.
+    assert_eq!(f.client.claim(), TOTAL * 3 / 10);
+    assert_eq!(f.token.balance(&f.beneficiary), TOTAL * 3 / 10);
+    f.assert_conserved();
+
+    // A second claim must fail because nothing is left to claim.
+    assert_eq!(
+        f.client.try_claim(),
+        Err(Ok(Error::VestingNothingToClaim)),
+        "claim after revoke exhausted must error"
+    );
+    // Beneficiary balance is unchanged.
+    assert_eq!(f.token.balance(&f.beneficiary), TOTAL * 3 / 10);
+    f.assert_conserved();
+}
+
 #[test]
 #[should_panic]
 fn revoke_requires_the_grantors_authorization() {
@@ -985,6 +1144,50 @@ fn revoke_emits_the_revoked_event() {
     let events = all.events();
     let last = events.last().expect("no events emitted");
     assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
+}
+
+/// Regression test for the `still_claimable: math::sub(vested, claimed)?`
+/// dead-calculation concern: claiming *exactly* the vested amount and then
+/// revoking in the same ledger leaves `claimed == vested`, so the event's
+/// subtraction is exactly zero. `revoke` must succeed rather than abort with
+/// `Underflow`, and there is nothing left claimable afterwards.
+#[test]
+fn revoke_succeeds_immediately_after_claiming_all_vested_tokens() {
+    let f = Fixture::new(true);
+    // Partial vest: at START + 300 with CLIFF = 100 and DURATION = 1_000,
+    // vested = TOTAL * 300 / 1_000 = 300_000.
+    f.at(START + 300);
+
+    let claimed = f.client.claim();
+    let vested_now = f.client.vested_amount(&(START + 300));
+    assert_eq!(
+        claimed, vested_now,
+        "claim must take the full vested amount"
+    );
+    assert_eq!(f.client.get().claimed, vested_now);
+
+    // Revoke at the very same timestamp: claimed == vested, so the event's
+    // `still_claimable` is exactly zero and `revoke` must not underflow.
+    let returned = f.client.revoke();
+    assert_eq!(
+        returned,
+        TOTAL - vested_now,
+        "only the unvested remainder is returned"
+    );
+
+    let events = f.env.events().all().filter_by_contract(&f.client.address);
+    let last = events.events().last().expect("no events emitted");
+    let expected = Revoked {
+        grantor: f.grantor.clone(),
+        returned_to_grantor: TOTAL - vested_now,
+        still_claimable: 0,
+        revoked_at: START + 300,
+    };
+    assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
+
+    // Nothing is left to claim, and conservation still holds.
+    assert_eq!(f.client.try_claim(), Err(Ok(Error::VestingNothingToClaim)));
+    f.assert_conserved();
 }
 
 // ------------------------------------------------------- conservation
@@ -1097,6 +1300,39 @@ fn vesting_with_long_duration_and_large_total_probes_overflow_boundary() {
     );
 }
 
+// ------------------------------------------------------- issue #223: vested_amount before start
+
+#[test]
+fn vested_amount_is_zero_before_the_start() {
+    let env = Env::default();
+    let g = bare(&env, CLIFF, DURATION);
+    // Any timestamp strictly before `start` must return exactly 0 — never negative.
+    assert_eq!(g.vested_amount(0), Ok(0));
+    assert_eq!(g.vested_amount(START - 1), Ok(0));
+    // Sanity: the boundary itself also returns 0 (nothing vested at t=start).
+    assert_eq!(g.vested_amount(START), Ok(0));
+}
+
+// ------------------------------------------------------- issue #224: claimable after partial claim
+
+#[test]
+fn claimable_equals_vested_minus_claimed_after_partial_claim() {
+    let f = Fixture::new(true);
+    // Advance to halfway through the schedule and make a first claim.
+    f.at(START + 500);
+    let first_claim = f.client.claim();
+    assert_eq!(first_claim, TOTAL / 2);
+
+    // Advance further; more has vested.
+    f.at(START + 750);
+    let claimable = f.client.claimable();
+    let grant = f.client.get();
+    // claimable must equal vested_at_now minus already_claimed.
+    let vested_now = f.client.vested_amount(&(START + 750));
+    assert_eq!(claimable, vested_now - grant.claimed);
+    f.assert_conserved();
+}
+
 // ---------------------------------------------------------------- property
 
 mod vested_amount_properties {
@@ -1185,6 +1421,93 @@ mod vested_amount_properties {
                 .expect("vested_amount(after revocation) must not error");
 
             prop_assert_eq!(at_revocation, after);
+        }
+    }
+}
+
+mod conservation_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One step of a random call sequence against a live grant. Invalid calls
+    /// (e.g. claiming before the cliff) are included on purpose: a rejected
+    /// call must roll back and preserve conservation.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Advance(u64),
+        Claim,
+        Revoke,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The vesting conservation invariant
+        /// `claimed + returned + remaining == total` holds after every call of
+        /// an arbitrary sequence of claim / revoke calls, and the contract's
+        /// real token balance always equals `remaining`.
+        #[test]
+        fn conservation_holds_after_any_call_sequence(
+            total in 1i128..=1_000_000_000,
+            duration in 1u64..=1_000,
+            cliff_frac in 0u64..=100,
+            ops in proptest::collection::vec(prop_oneof![
+                (1u64..=500).prop_map(Op::Advance),
+                Just(Op::Claim),
+                Just(Op::Revoke),
+            ], 1..=24),
+        ) {
+            let start = 1_000_000u64;
+            let cliff = duration.saturating_mul(cliff_frac) / 100;
+            let te = TestEnv::at(start);
+            let (token, grantor) = te.make_token(1_000_000_000_000_000);
+            let token_address = token.address.clone();
+            let beneficiary = te.make_address();
+            let env = te.env().clone();
+
+            let client = VestingContractClient::new(&env, &env.register(VestingContract, ()));
+            client.create(
+                &grantor,
+                &beneficiary,
+                &token_address,
+                &total,
+                &start,
+                &cliff,
+                &duration,
+                &true,
+            );
+
+            for op in ops {
+                match op {
+                    Op::Advance(delta) => {
+                        te.advance_to(te.timestamp().saturating_add(delta));
+                    }
+                    Op::Claim => {
+                        let _ = client.try_claim();
+                    }
+                    Op::Revoke => {
+                        let _ = client.try_revoke();
+                    }
+                }
+
+                let g = client.get();
+                let remaining = client.remaining();
+                prop_assert!(
+                    g.claimed >= 0 && g.returned >= 0 && remaining >= 0,
+                    "negative component after {:?}: {:?}", op, g
+                );
+                prop_assert_eq!(
+                    g.claimed + g.returned + remaining,
+                    g.total,
+                    "conservation violated after {:?}: {:?}", op, g
+                );
+                prop_assert_eq!(
+                    token.balance(&client.address),
+                    remaining,
+                    "held balance diverged after {:?}: {:?}", op, g
+                );
+            }
         }
     }
 }

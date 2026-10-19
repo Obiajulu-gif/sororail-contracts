@@ -21,6 +21,21 @@ use sororail_common::math;
 /// This is a deliberate consumer-protection choice, not an oversight. It costs
 /// the payee the revenue of periods they did not collect, and it guarantees
 /// the payer can never be surprised by a bundled back-charge.
+///
+/// # The pull invariant
+///
+/// Because this contract holds no funds, there is nothing for it to conserve
+/// internally; the invariant is on what it can move. Every successful `charge`
+/// transfers exactly `amount_per_period` from the payer to the payee and
+/// increments `periods_charged` by one, and a failed transfer reverts the
+/// increment with it. So the total ever pulled is always exactly:
+///
+/// ```text
+/// periods_charged * amount_per_period
+/// ```
+///
+/// and, when `max_periods` is set, never more than `max_periods *
+/// amount_per_period`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authorization {
@@ -107,5 +122,64 @@ mod tests {
         let uncapped = authorization(None, u32::MAX);
         assert_eq!(uncapped.remaining_periods(), None);
         assert!(!uncapped.is_exhausted());
+    }
+
+    #[test]
+    fn is_exhausted_is_true_exactly_when_periods_charged_equals_the_cap() {
+        let env = Env::default();
+        let authorization = |max_periods, periods_charged| Authorization {
+            payer: Address::generate(&env),
+            payee: Address::generate(&env),
+            token: Address::generate(&env),
+            amount_per_period: 1,
+            period_seconds: 1,
+            max_periods,
+            periods_charged,
+            next_chargeable_at: 0,
+            cancelled: false,
+        };
+
+        // Not exhausted when periods_charged < max_periods
+        let before_cap = authorization(Some(5), 4);
+        assert!(!before_cap.is_exhausted());
+
+        // Exhausted exactly when periods_charged == max_periods
+        let at_cap = authorization(Some(5), 5);
+        assert!(at_cap.is_exhausted());
+
+        // Exhausted when periods_charged > max_periods (should not happen in practice)
+        let over_cap = authorization(Some(5), 6);
+        assert!(over_cap.is_exhausted());
+
+        // Not exhausted when uncapped (None)
+        let uncapped = authorization(None, 100);
+        assert!(!uncapped.is_exhausted());
+    }
+
+    #[test]
+    fn is_chargeable_at_is_false_before_the_first_period() {
+        let env = Env::default();
+        let first_chargeable_at = 1000u64;
+        let authorization = Authorization {
+            payer: Address::generate(&env),
+            payee: Address::generate(&env),
+            token: Address::generate(&env),
+            amount_per_period: 100,
+            period_seconds: 100,
+            max_periods: None,
+            periods_charged: 0,
+            next_chargeable_at: first_chargeable_at,
+            cancelled: false,
+        };
+
+        // Before next_chargeable_at: not chargeable
+        assert!(!authorization.is_chargeable_at(first_chargeable_at - 1));
+        assert!(!authorization.is_chargeable_at(0));
+
+        // At next_chargeable_at: chargeable
+        assert!(authorization.is_chargeable_at(first_chargeable_at));
+
+        // After next_chargeable_at: chargeable
+        assert!(authorization.is_chargeable_at(first_chargeable_at + 1));
     }
 }

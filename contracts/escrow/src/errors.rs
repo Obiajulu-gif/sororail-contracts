@@ -27,6 +27,7 @@
 //! | [`Error::EscrowNotDisputed`] | `resolve` when not in `Disputed` |
 //! | [`Error::EscrowAlreadyDisputed`] | `dispute` when already disputed |
 //! | [`Error::EscrowNotCancellable`] | `cancel` when not in `Created` |
+//! | [`Error::EscrowArbiterNotNeutral`] | `init` when the arbiter is either escrow party |
 //!
 //! # What is absent, and why
 //!

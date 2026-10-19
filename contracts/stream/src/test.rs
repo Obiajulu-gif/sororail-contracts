@@ -642,11 +642,35 @@ fn withdraw_takes_a_partial_amount() {
 fn withdraw_rejects_more_than_has_accrued() {
     let f = Fixture::new(true);
     f.at(START + 300);
+
+    let available_before = f.client.balance_of(&f.recipient);
+    let stream_before = f.client.get();
+    let held_before = f.held();
+    let recipient_balance_before = f.token.balance(&f.recipient);
+    let sender_balance_before = f.token.balance(&f.sender);
+
+    assert_eq!(available_before, RATE * 300);
     assert_eq!(
-        f.client.try_withdraw(&Some(RATE * 301)),
+        f.client.try_withdraw(&Some(available_before + 1)),
         Err(Ok(Error::StreamInsufficientAccrued))
     );
-    assert_eq!(f.held(), DEPOSITED);
+
+    // A rejected withdrawal must not change accounting or transfer any tokens.
+    assert_eq!(f.client.get(), stream_before);
+    assert_eq!(f.client.balance_of(&f.recipient), available_before);
+    assert_eq!(f.client.remaining(), held_before);
+    assert_eq!(f.held(), held_before);
+    assert_eq!(f.token.balance(&f.recipient), recipient_balance_before);
+    assert_eq!(f.token.balance(&f.sender), sender_balance_before);
+    f.assert_conserved();
+
+    // The same accrued balance must remain withdrawable after the failed call.
+    assert_eq!(f.client.withdraw(&Some(available_before)), available_before);
+    assert_eq!(
+        f.token.balance(&f.recipient),
+        recipient_balance_before + available_before
+    );
+    f.assert_conserved();
 }
 
 #[test]

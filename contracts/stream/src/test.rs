@@ -606,10 +606,15 @@ fn withdraw_none_drains_accrued_then_reports_nothing_left() {
 }
 
 #[test]
-fn withdraw_emits_the_withdrawn_event() {
+fn withdraw_event_amount_matches_the_token_transfer() {
     let f = Fixture::new(true);
     f.at(START + 300);
-    f.client.withdraw(&None);
+    let recipient_before = f.token.balance(&f.recipient);
+    let withdrawn = f.client.withdraw(&Some(RATE * 100));
+    let transferred = f.token.balance(&f.recipient) - recipient_before;
+
+    assert_eq!(transferred, RATE * 100);
+    assert_eq!(withdrawn, transferred);
 
     // `withdraw` emits the token's own transfer event before its own
     // `Withdrawn`, so take the last event rather than assuming an index.
@@ -618,8 +623,8 @@ fn withdraw_emits_the_withdrawn_event() {
     let last = events.last().expect("no events emitted");
     let expected = Withdrawn {
         recipient: f.recipient.clone(),
-        amount: RATE * 300,
-        total_withdrawn: RATE * 300,
+        amount: transferred,
+        total_withdrawn: f.client.get().withdrawn,
     };
     assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
 }

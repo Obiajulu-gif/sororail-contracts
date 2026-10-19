@@ -116,38 +116,42 @@ fn execute_pays_each_recipient_their_own_amount() {
 }
 
 #[test]
-fn execute_allows_funder_as_recipient_without_deducting_self_payments() {
+fn execute_emits_the_total_and_recipient_count() {
     let f = Fixture::new();
-    let contractor = Address::generate(&f.env);
-    let batch = vec![
+    let recipients = f.addresses(2);
+    let payments = vec![
         &f.env,
         Payment {
-            to: f.funder.clone(),
-            amount: 70,
-        },
-        Payment {
-            to: contractor.clone(),
+            to: recipients.get(0).unwrap(),
             amount: 125,
         },
         Payment {
-            to: f.funder.clone(),
-            amount: 30,
+            to: recipients.get(1).unwrap(),
+            amount: 875,
         },
     ];
 
-    // A self-payment is an intentional no-op, but each line still contributes
-    // to the receipt's count and declared total for payroll reconciliation.
-    let expected = Receipt {
-        count: 3,
-        total: 225,
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
+    let expected = Executed {
+        funder: f.funder,
+        token: f.token.address,
+        count: 2,
+        total: 1_000,
     };
-    assert_eq!(f.client.preview(&batch), expected);
     assert_eq!(
-        f.client.execute(&f.funder, &f.token.address, &batch),
-        expected
+        f.env.events().all().last().unwrap(),
+        expected.to_xdr(&f.env, &f.client.address)
     );
-    assert_eq!(f.token.balance(&contractor), 125);
-    assert_eq!(f.token.balance(&f.funder), MINT - 125);
+}
+
+#[test]
+fn execute_leaves_no_token_balance_on_the_contract() {
+    let f = Fixture::new();
+    let payments = f.payments(3, 37);
+
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
     assert_eq!(f.token.balance(&f.client.address), 0);
 }
 
@@ -422,32 +426,18 @@ fn execute_equal_pays_everyone_the_same() {
 }
 
 #[test]
-fn execute_equal_allows_funder_as_recipient_without_deducting_self_payments() {
+fn execute_equal_applies_the_exact_amount_without_rounding() {
     let f = Fixture::new();
-    let contractor = Address::generate(&f.env);
-    let recipients = vec![
-        &f.env,
-        f.funder.clone(),
-        contractor.clone(),
-        f.funder.clone(),
-    ];
+    let recipients = f.addresses(3);
 
     let receipt = f
         .client
-        .execute_equal(&f.funder, &f.token.address, &recipients, &80);
+        .execute_equal(&f.funder, &f.token.address, &recipients, &7);
 
-    // Three requested lines are counted even though the two funder-to-self
-    // transfers have no net effect on the funder's token balance.
-    assert_eq!(
-        receipt,
-        Receipt {
-            count: 3,
-            total: 240
-        }
-    );
-    assert_eq!(f.token.balance(&contractor), 80);
-    assert_eq!(f.token.balance(&f.funder), MINT - 80);
-    assert_eq!(f.token.balance(&f.client.address), 0);
+    assert_eq!(receipt, Receipt { count: 3, total: 21 });
+    for recipient in recipients.iter() {
+        assert_eq!(f.token.balance(&recipient), 7);
+    }
 }
 
 #[test]

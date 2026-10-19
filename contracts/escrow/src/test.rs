@@ -190,6 +190,62 @@ fn init_rejects_a_second_call() {
 }
 
 #[test]
+fn init_rejects_arbiter_equal_to_depositor_or_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let depositor = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let neutral_arbiter = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Each failure happens on a fresh contract so we can also prove an
+    // invalid configuration does not consume the one-time init slot.
+    for conflicted_arbiter in [depositor.clone(), beneficiary.clone()] {
+        let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+        assert_eq!(
+            client.try_init(
+                &depositor,
+                &beneficiary,
+                &Some(conflicted_arbiter),
+                &token,
+                &AMOUNT,
+                &DEADLINE,
+            ),
+            Err(Ok(Error::EscrowArbiterNotNeutral))
+        );
+        assert_eq!(client.try_get(), Err(Ok(Error::NotInitialized)));
+
+        // A corrected, independent arbiter can still initialize the same
+        // contract; the failed attempt did not persist any agreement.
+        client.init(
+            &depositor,
+            &beneficiary,
+            &Some(neutral_arbiter.clone()),
+            &token,
+            &AMOUNT,
+            &DEADLINE,
+        );
+        assert_eq!(client.get().arbiter, Some(neutral_arbiter.clone()));
+    }
+}
+
+#[test]
+fn init_allows_no_arbiter_even_when_depositor_equals_beneficiary() {
+    let env = TestEnv::at(START_TS).env().clone();
+    env.mock_all_auths();
+    let party = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+
+    // Neutrality applies only when Some(arbiter) is requested. Existing
+    // no-arbitration and same-party agreements remain backward-compatible.
+    client.init(&party, &party, &None, &token, &AMOUNT, &DEADLINE);
+    let agreement = client.get();
+    assert_eq!(agreement.arbiter, None);
+    assert_eq!(agreement.depositor, agreement.beneficiary);
+}
+
+#[test]
 fn init_rejects_non_positive_amounts() {
     let env = TestEnv::at(START_TS).env().clone();
     env.mock_all_auths();
@@ -538,6 +594,22 @@ fn release_rejects_a_closed_escrow() {
     );
 }
 
+/// `release` must reject a disputed escrow with `EscrowNotFunded`: the
+/// arbiter owns the outcome once a dispute is open, so the beneficiary
+/// cannot be paid out from under it. The balance must stay in the contract.
+#[test]
+fn release_rejects_a_disputed_escrow() {
+    let f = Fixture::funded(true);
+    f.client.dispute(&f.depositor);
+    assert_eq!(
+        f.client.try_release(&f.arbiter),
+        Err(Ok(Error::EscrowNotFunded))
+    );
+    assert_eq!(f.client.state(), State::Disputed);
+    assert_eq!(f.escrow_balance(), AMOUNT);
+    assert_eq!(f.token.balance(&f.beneficiary), 0);
+}
+
 // ---------------------------------------------------------------- refund
 
 #[test]
@@ -791,6 +863,45 @@ fn resolve_rejects_basis_points_above_the_maximum() {
     );
     // Still resolvable afterwards -- the failed call changed nothing.
     assert_eq!(f.client.state(), State::Disputed);
+}
+
+#[test]
+fn resolve_rejects_a_split_whose_product_overflows_at_the_max_amount() {
+    // `split_bps` multiplies `amount * bps` in i128 before dividing, so an
+    // escrow holding exactly i128::MAX can only be resolved at 0 or 1 bps;
+    // 2 bps is the first split whose intermediate product overflows. (The
+    // shared `Fixture` mints `amount * 10`, which cannot be built at MAX.)
+    let te = TestEnv::at(START_TS);
+    let (token, depositor) = te.make_token(i128::MAX);
+    let token_address = token.address.clone();
+    let beneficiary = te.make_address();
+    let arbiter = te.make_address();
+    let env = te.env().clone();
+    let client = EscrowContractClient::new(&env, &env.register(EscrowContract, ()));
+    client.init(
+        &depositor,
+        &beneficiary,
+        &Some(arbiter),
+        &token_address,
+        &i128::MAX,
+        &DEADLINE,
+    );
+    client.fund();
+    client.dispute(&depositor);
+
+    assert_eq!(client.try_resolve(&2), Err(Ok(Error::Overflow)));
+    // The failed call changed nothing.
+    assert_eq!(client.state(), State::Disputed);
+    assert_eq!(token.balance(&client.address), i128::MAX);
+
+    // 1 bps is the largest split that still resolves, and it conserves the
+    // full amount exactly.
+    client.resolve(&1);
+    let to_beneficiary = i128::MAX / 10_000;
+    assert_eq!(token.balance(&beneficiary), to_beneficiary);
+    assert_eq!(token.balance(&depositor), i128::MAX - to_beneficiary);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.state(), State::Resolved);
 }
 
 #[test]

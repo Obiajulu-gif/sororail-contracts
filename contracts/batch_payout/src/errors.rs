@@ -17,6 +17,10 @@
 //! Number 102 was `BatchDuplicateRecipient`, removed before release: detecting
 //! duplicates on-chain costs a quadratic scan, and paying one address twice in
 //! a batch is legitimate. That check belongs in the client's CSV import.
+//! A recipient equal to the funder is also permitted (including repeated
+//! funder entries): it is a no-op token transfer, but the receipt still counts
+//! the submitted lines and their amounts. Only an address equal to this
+//! contract itself triggers `IdenticalParties`.
 //!
 //! `AlreadyInitialized` and `NotInitialized` do not appear: this contract is
 //! stateless, with no `init` and no `storage.rs`.

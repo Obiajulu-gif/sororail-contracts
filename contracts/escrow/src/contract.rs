@@ -19,6 +19,19 @@ impl EscrowContract {
     ///
     /// `deadline` is a ledger timestamp and must be in the future. After it
     /// passes, the depositor may refund unilaterally.
+    ///
+    /// `arbiter` is optional. When it is `None`:
+    ///
+    /// - `dispute` returns [`Error::EscrowNoArbiter`], so the escrow can never
+    ///   enter `Disputed`.
+    /// - `resolve` is unreachable, because it is only callable from `Disputed`.
+    /// - `release` is callable only by the depositor, and `refund` only by the
+    ///   depositor after the deadline. Neither party can force a dispute, and
+    ///   no third party can intervene.
+    ///
+    /// Choose `Some(arbiter)` whenever the parties may need a neutral split.
+    /// An arbiter must be distinct from both depositor and beneficiary.
+    /// `None` is only safe when the depositor is trusted to release or refund.
     pub fn init(
         env: Env,
         depositor: Address,
@@ -34,6 +47,14 @@ impl EscrowContract {
         math::require_positive(amount)?;
         if deadline <= env.ledger().timestamp() {
             return Err(Error::InvalidTimeRange);
+        }
+        // Reject conflicted arbitrators before persisting an agreement or
+        // requesting a depositor signature. `None` retains the existing
+        // explicit no-arbitration behavior.
+        if let Some(ref neutral) = arbiter {
+            if *neutral == depositor || *neutral == beneficiary {
+                return Err(Error::EscrowArbiterNotNeutral);
+            }
         }
         depositor.require_auth();
 

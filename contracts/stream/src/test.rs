@@ -16,7 +16,7 @@ use sororail_common::{storage::INSTANCE_BUMP, testutils::TestEnv, Error};
 
 use crate::{
     contract::{StreamContract, StreamContractClient},
-    events::{Cancelled, Created, ToppedUp, Withdrawn},
+    events::{Cancelled, Created, Extended, ToppedUp, Withdrawn},
     types::Stream,
 };
 
@@ -134,7 +134,6 @@ fn nothing_accrues_before_start() {
 }
 
 #[test]
- test/issues-296-299-lifecycle-properties
 fn accrual_is_linear_between_start_and_stop() {
     let env = Env::default();
     let s = bare(&env);
@@ -261,6 +260,29 @@ fn create_emits_the_created_event() {
 }
 
 #[test]
+fn create_emits_the_created_event_with_rate_and_span() {
+    let f = Fixture::new(true);
+    let all = f.env.events().all();
+    let events = all.events();
+    let last = events.last().expect("no events emitted");
+    let expected = Created {
+        sender: f.sender.clone(),
+        recipient: f.recipient.clone(),
+        token: f.token.address.clone(),
+        rate_per_second: RATE,
+        start: START,
+        stop: STOP,
+        cancellable: true,
+        deposited: DEPOSITED,
+    };
+    assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
+    // The event's rate and span describe the stream that was stored.
+    let s = f.client.get();
+    assert_eq!(s.rate_per_second, RATE);
+    assert_eq!(s.stop - s.start, DURATION);
+}
+
+#[test]
 fn create_rejects_a_non_positive_rate() {
     let env = Env::default();
     env.mock_all_auths();
@@ -298,6 +320,44 @@ fn create_rejects_an_empty_or_inverted_span() {
             "stop {bad_stop} was accepted"
         );
     }
+}
+
+#[test]
+fn create_rejects_a_stop_before_start() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = START);
+    let c = StreamContractClient::new(&env, &env.register(StreamContract, ()));
+    let (a, b, t) = (
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    );
+    assert_eq!(
+        c.try_create(&a, &b, &t, &RATE, &START, &(START - 1), &true),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+    // The rejected call must not have persisted a stream.
+    assert_eq!(c.try_get(), Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn create_rejects_a_zero_length_span() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = START);
+    let c = StreamContractClient::new(&env, &env.register(StreamContract, ()));
+    let (a, b, t) = (
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    );
+    assert_eq!(
+        c.try_create(&a, &b, &t, &RATE, &START, &START, &true),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+    // The rejected call must not have persisted a stream.
+    assert_eq!(c.try_get(), Err(Ok(Error::NotInitialized)));
 }
 
 #[test]
@@ -526,6 +586,25 @@ fn withdraw_none_takes_everything_available() {
     f.assert_conserved();
 }
 
+/// Issue #232: `withdraw(None)` with no unwithdrawn accrual left is rejected;
+/// the None path must not silently no-op.
+#[test]
+fn withdraw_none_drains_accrued_then_reports_nothing_left() {
+    let f = Fixture::new(true);
+    f.at(START + 250);
+    assert_eq!(f.client.withdraw(&None), RATE * 250);
+    assert_eq!(f.token.balance(&f.recipient), RATE * 250);
+    assert_eq!(f.client.balance_of(&f.recipient), 0);
+    assert_eq!(f.client.remaining(), DEPOSITED - RATE * 250);
+    f.assert_conserved();
+
+    // In the same instant nothing new accrued, so a second None has nothing
+    // to take and errors rather than transferring zero.
+    assert_eq!(f.client.try_withdraw(&None), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(f.client.remaining(), DEPOSITED - RATE * 250);
+    f.assert_conserved();
+}
+
 #[test]
 fn withdraw_emits_the_withdrawn_event() {
     let f = Fixture::new(true);
@@ -591,6 +670,32 @@ fn withdraw_some_zero_distinctly_from_none_with_zero_accrued() {
     assert_eq!(some_zero_result, Err(Ok(Error::InvalidAmount)));
 }
 
+/// `None` and `Some(0)` reach the same `InvalidAmount` error from *different*
+/// paths even once the stream has accrued: `None` substitutes the (positive)
+/// available amount and would succeed, while `Some(0)` is passed straight to
+/// `require_positive` and must be rejected on its own. Zero accrued is not the
+/// only case that distinguishes them.
+#[test]
+fn withdraw_some_zero_fails_even_when_accrual_is_positive() {
+    let f = Fixture::new(true);
+    f.at(START + 300);
+
+    // Sanity: with positive accrual, `None` withdraws everything.
+    let accrued = f.client.balance_of(&f.recipient);
+    assert!(accrued > 0);
+
+    // `Some(0)` is validated directly and rejected regardless of accrual.
+    assert_eq!(
+        f.client.try_withdraw(&Some(0)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(f.client.balance_of(&f.recipient), accrued);
+
+    // `None`, by contrast, succeeds and drains exactly the accrued amount.
+    assert_eq!(f.client.withdraw(&None), accrued);
+    assert_eq!(f.client.balance_of(&f.recipient), 0);
+}
+
 #[test]
 fn withdrawing_the_whole_stream_after_stop_empties_the_contract() {
     let f = Fixture::new(true);
@@ -650,6 +755,29 @@ fn cancel_settles_the_recipient_and_refunds_the_sender() {
     f.assert_conserved();
 }
 
+/// Issue #235: `cancel` splits the deposit exactly — the accrued portion is
+/// settled to the recipient and the unaccrued remainder is refunded to the
+/// sender, with the recorded totals matching the transfers.
+#[test]
+fn cancel_splits_accrued_to_recipient_and_unaccrued_to_sender() {
+    let f = Fixture::new(true);
+    let sender_before = f.token.balance(&f.sender);
+    f.at(START + 600);
+    f.client.cancel();
+
+    let accrued = RATE * 600;
+    let unaccrued = DEPOSITED - accrued;
+    assert_eq!(f.token.balance(&f.recipient), accrued);
+    assert_eq!(f.token.balance(&f.sender), sender_before + unaccrued);
+
+    let s = f.client.get();
+    assert_eq!(s.withdrawn, accrued);
+    assert_eq!(s.refunded, unaccrued);
+    assert_eq!(f.client.remaining(), 0);
+    assert_eq!(f.held(), 0);
+    f.assert_conserved();
+}
+
 #[test]
 fn cancel_emits_the_cancelled_event() {
     let f = Fixture::new(true);
@@ -688,6 +816,10 @@ fn cancel_rejects_a_second_call() {
 
 /// Only the sender may cancel: a caller authorizing as anyone else hits the
 /// host's auth check, not a contract error, and the stream is left intact.
+///
+/// The host narrows every non-`Contract` host error to
+/// `Context`/`InvalidAction` before it crosses back to the guest, so a failed
+/// `require_auth` surfaces as that pair rather than `Auth`/`InvalidAction`.
 #[test]
 fn cancel_is_rejected_for_a_non_sender_caller() {
     let f = Fixture::new(true);
@@ -714,7 +846,7 @@ fn cancel_is_rejected_for_a_non_sender_caller() {
         assert_eq!(
             res,
             Err(Ok(soroban_sdk::Error::from_type_and_code(
-                ScErrorType::Auth,
+                ScErrorType::Context,
                 ScErrorCode::InvalidAction,
             )))
         );
@@ -908,6 +1040,66 @@ fn top_up_rejects_a_span_that_overflows_the_stop_timestamp() {
 }
 
 #[test]
+fn top_up_rejects_seconds_that_fit_u64_but_overflow_the_stop_timestamp() {
+    // rate = 1, so `amount` is exactly the seconds added. Unlike the `2^64`
+    // case above, `seconds` here is a valid `u64`, so the `u64::try_from` step
+    // passes and only the `stop.checked_add(seconds)` step can reject it:
+    // `(START + 1) + (u64::MAX - START)` is `u64::MAX + 1`.
+    let te = TestEnv::at(START);
+    let (token_client, sender) = te.make_token(i128::MAX);
+    let token = token_client.address.clone();
+    let recipient = te.make_address();
+    let env = te.env().clone();
+    let c = StreamContractClient::new(&env, &env.register(StreamContract, ()));
+    c.create(&sender, &recipient, &token, &1, &START, &(START + 1), &true);
+
+    assert_eq!(
+        c.try_top_up(&i128::from(u64::MAX - START)),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+
+    // The failed call changed nothing.
+    let s = c.get();
+    assert_eq!(s.stop, START + 1);
+    assert_eq!(s.deposited, 1);
+
+    // One second less lands exactly on `u64::MAX`, the largest `stop` that
+    // can be represented, and must be accepted.
+    c.top_up(&i128::from(u64::MAX - START - 1));
+    assert_eq!(c.get().stop, u64::MAX);
+}
+
+#[test]
+fn top_up_rejects_a_deposit_total_that_overflows() {
+    // rate = i128::MAX / 2 over a 1-second span funds `rate`. Topping up
+    // 2 seconds' worth (`2 * rate == i128::MAX - 1`) is itself representable and
+    // a whole number of seconds, but `deposited + amount` is not.
+    let rate = i128::MAX / 2;
+    let te = TestEnv::at(START);
+    let (token_client, sender) = te.make_token(i128::MAX);
+    let token = token_client.address.clone();
+    let recipient = te.make_address();
+    let env = te.env().clone();
+    let c = StreamContractClient::new(&env, &env.register(StreamContract, ()));
+    c.create(
+        &sender,
+        &recipient,
+        &token,
+        &rate,
+        &START,
+        &(START + 1),
+        &true,
+    );
+
+    assert_eq!(c.try_top_up(&(rate * 2)), Err(Ok(Error::Overflow)));
+
+    // The failed call changed nothing.
+    let s = c.get();
+    assert_eq!(s.stop, START + 1);
+    assert_eq!(s.deposited, rate);
+}
+
+#[test]
 fn top_up_is_rejected_after_cancellation() {
     let f = Fixture::new(true);
     f.client.cancel();
@@ -993,6 +1185,35 @@ fn extend_rejects_funding_that_overflows() {
 }
 
 #[test]
+fn extend_rejects_a_deposit_total_that_overflows() {
+    // rate = i128::MAX / 2 over a 1-second span funds `rate`. Extending by 2
+    // more seconds needs `2 * rate == i128::MAX - 1`, which is representable,
+    // so the multiplication passes and only `deposited + added` overflows.
+    let rate = i128::MAX / 2;
+    let te = TestEnv::at(START);
+    let (token_client, sender) = te.make_token(i128::MAX);
+    let token = token_client.address.clone();
+    let recipient = te.make_address();
+    let c = StreamContractClient::new(te.env(), &te.env().register(StreamContract, ()));
+    c.create(
+        &sender,
+        &recipient,
+        &token,
+        &rate,
+        &START,
+        &(START + 1),
+        &true,
+    );
+
+    assert_eq!(c.try_extend(&(START + 3)), Err(Ok(Error::Overflow)));
+
+    // The failed call changed nothing.
+    let s = c.get();
+    assert_eq!(s.stop, START + 1);
+    assert_eq!(s.deposited, rate);
+}
+
+#[test]
 fn extend_is_rejected_after_cancellation() {
     let f = Fixture::new(true);
     f.client.cancel();
@@ -1014,6 +1235,7 @@ fn extend_emits_the_extended_event() {
     let env = &f.env;
     let added: Val = (RATE * 300).into_val(env);
     let deposited: Val = (DEPOSITED + RATE * 300).into_val(env);
+    let old_stop: Val = STOP.into_val(env);
     let new_stop: Val = new_stop_val.into_val(env);
     // Map data: keys are the field names, serialized in sorted order.
     let data: Val = map![
@@ -1021,6 +1243,7 @@ fn extend_emits_the_extended_event() {
         (Symbol::new(env, "added"), added),
         (Symbol::new(env, "deposited"), deposited),
         (Symbol::new(env, "new_stop"), new_stop),
+        (Symbol::new(env, "old_stop"), old_stop),
     ]
     .into_val(env);
     assert_eq!(
@@ -1041,6 +1264,74 @@ fn extend_emits_the_extended_event() {
     );
 }
 
+#[test]
+fn extend_moves_the_stop_later_and_preserves_the_rate_and_conservation() {
+    let f = Fixture::new(true);
+    let before = f.client.get();
+    let new_stop = before.stop + 400;
+    f.client.extend(&new_stop);
+
+    let after = f.client.get();
+    // The stop moved later, by exactly the requested amount.
+    assert_eq!(after.stop, new_stop);
+    assert!(after.stop > before.stop);
+    // The rate is a property of the stream, not the span: it is unchanged, so
+    // `deposited` is recomputable as `rate * (stop - start)`.
+    assert_eq!(after.rate_per_second, before.rate_per_second);
+    assert_eq!(
+        after.deposited,
+        after.rate_per_second * i128::from(after.stop - after.start)
+    );
+    // ...and the conservation invariant still holds after the extension.
+    f.assert_conserved();
+}
+
+#[test]
+fn extend_refuses_to_shorten_the_stream_and_changes_nothing() {
+    let f = Fixture::new(true);
+    f.at(START + 100);
+    let before = f.client.get();
+    let held = f.held();
+    let sender_balance = f.token.balance(&f.sender);
+
+    // Every stop at or before the current one is a shortening (or a no-op),
+    // and `extend` only ever moves the stop later, so all are refused.
+    for bad in [before.stop - 1, before.stop, before.stop - 100] {
+        assert_eq!(
+            f.client.try_extend(&bad),
+            Err(Ok(Error::StreamNotExtendable)),
+            "new_stop {bad} was accepted"
+        );
+    }
+
+    // A refused extension applies nothing: no state change, no tokens pulled.
+    assert_eq!(f.client.get(), before);
+    assert_eq!(f.held(), held);
+    assert_eq!(f.token.balance(&f.sender), sender_balance);
+}
+
+#[test]
+fn extend_event_carries_the_old_and_new_stop_times() {
+    let f = Fixture::new(true);
+    let old_stop = f.client.get().stop;
+    let new_stop = old_stop + 300;
+    f.client.extend(&new_stop);
+
+    // `extend` emits the token's transfer event before its own `Extended`,
+    // so take the last event rather than assuming an index.
+    let all = f.env.events().all();
+    let events = all.events();
+    let last = events.last().expect("no events emitted");
+    let expected = Extended {
+        sender: f.sender.clone(),
+        added: RATE * 300,
+        old_stop,
+        new_stop,
+        deposited: DEPOSITED + RATE * 300,
+    };
+    assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
+}
+
 // -------------------------------------------------------------- balance_of
 
 #[test]
@@ -1059,6 +1350,23 @@ fn balance_of_sender_is_zero_once_cancelled() {
     f.client.cancel();
     assert_eq!(f.client.balance_of(&f.sender), 0);
     assert_eq!(f.client.balance_of(&f.recipient), 0);
+}
+
+#[test]
+fn balance_of_shows_the_recipient_accrued_minus_withdrawn_and_the_sender_the_unstreamed_remainder()
+{
+    let f = Fixture::new(true);
+    f.at(START + 300);
+    f.client.withdraw(&Some(RATE * 100));
+    f.at(START + 400);
+
+    // Recipient: accrued so far (RATE * 400) minus what was already withdrawn.
+    assert_eq!(f.client.balance_of(&f.recipient), RATE * 400 - RATE * 100);
+    // Sender: the part of the deposit that has not accrued at all yet.
+    assert_eq!(f.client.balance_of(&f.sender), DEPOSITED - RATE * 400);
+    // Anyone else sees nothing.
+    assert_eq!(f.client.balance_of(&f.outsider), 0);
+    f.assert_conserved();
 }
 
 // ---------------------------------------------------- conservation, mixed
@@ -1270,6 +1578,108 @@ mod accrued_at_properties {
     }
 }
 
-fn accrual_is_linear_between_start_and]u髆GР陬澠瓂軄偷叡睍托佌攻衻箿赴佂焉浇撂(€€€€技紒櫧葋a14皝饺佈亯呁攣展バ亼暀ス晲亯鋪选攣呀瓡笣虂憰崶祬碧じ(€€€伭請伾呇晑習蓕蜁嵔箰鑱つ揉�(€€€€技紒1晳潟葋靴禃脱叺纴呅佪ˉ崰亝崓烧叞亯暆ス贪仴竵蜁嵔箲虂庭箥攣选攣U攻�(€€€€技紒暳綅牳(€€€伭請佂褏尚鑱载邪(€€€€技紒1晳潟葋靴禃脱叺纴呅佪ˉ崰亝崓烧叞仌箲贪仴竵蜁嵔箲虂庭箥攣选攣U攻�(€€€€技紒暳綅牳(€€€伭請佂呀黎佋匦�(€€€€技紒]选暼佈佂暪憰葋祬鋪崊箥暟亯暀缴攣佂呀羳�(€€€伭請亶吂崟北厜睌鑱壗桨�(€€€€技紒Q窖叞仌贂葋琳北晲仚山磥选攣蜁箲暼皝ジ佈佈江暩澨佂祬北曂衼展バ竵陛呭�(€€€€技紒伾呇晑習蓕蜁嵔箰€█⊥呀纮磥脱吷啸€�(€€€伭請亼暳酵パ晲鑱つ揉�(€€€€技紒Q窖叞仌贂葋羺伣招佈紒选攣蓵崶隶暪邪仴竵选攣呀瓡笣虂偷叡睍托佌攻懈(€€€伭請佪パ蓞莞鑱つ揉�(€€€€技紒Q窖叞仌贂葋蓵颜晒晲佈紒选攣蜁箲暼伣竵崊箥暠眳靴礁皝ジ佈佈江暩澨(€€€€技紒偷叡睍托佌攻懈(€€€伭請伾暀展憰愯仱娜喟(€€€€技紒]竵选攣脱蓵叴佪吿亶吂崟北晲皝仴衼輩贪仴竵蜁嵔箲虂庭箥攣选攣U攻�(€€€€技紒暳綅牳�崓烧叞佂呀撂仭暽敻(€€€伭請亶吂崟北晳}呅鑱=裂ソ格载续�)�()サ涟丮焉晠磥�(€€€€技紒Q窖叞亝崓烧晲佈紒选攣蓵崶隶暪衼吿伣榿亝褉皝荨曆葋荪选懮呡竵饺伖叫�(€€€€技�(€€€€技紒A丈旇伖紒脱缴厺敯伖紒暪佶山沟暪懈�
-眳盗晲亝衼壗褷仌箲虁创伖窖ˉ箿(€€€€技紒厤嵣諘虂墪櫧蓴亖脱吷褉皝吂悂厤嵣諈皝毖虂呅亖脱搅€伣葋呅佈(€€€€技紒崊箥暠眳靴礁佈サ曂褏道皝荨贂葋嵔禃虂櫏赏懈丵伾曂毡衼崊竵箷贂�(€€€€技紒曖崟晲亖憰两庭褧憖�(€€€伭請仚竵厤嵣諘憓呅牂蜁睒皝呅鑱载肖€带両曂毡旭つ揉皝缮饺鴣�(€€€€€€€伇曅伒招仌櫃晬靴贁€魜呅�(€€€€€€€仴榿睍衼M降敗崊箥暠睍悿€魜蜁睒箥吂崟北晳}呅侅(€€€€€€€€€€€仌櫃晬靴贁€魜暀檿嵮ベ敼单浮崊箥暠睍悿�(€€€€€€€侓(€€€€€€€仌櫃晬靴贁€魜暀檿嵮ベ敼单浮蜁睒雇呀坤�((€€€€€€€仴榿暀檿嵮ベ攢痿佂暠樄脱吷衼�(€€€€€€€€€€€伾曆丈竵=瑺坤�(€€€€€€€侓(€€€€€€€伇曅仌眳镣晲€魜祬褷栝驼垺つ揉栝櫳酱櫃晬靴贁ぐ仱娜噼闄山础蜁睒雇褏尚い(€€€€€€€伇曅亝崓烧晲€魜祬褷栝嫡啊蜁睒股呇晑習蓕蜁嵔箰皝暠吜蜁悿(€€€€€€€�=祬褷栝单浮厤嵣諘惏佂暠樄憰两庭褧悿�(€€€侓((€€€€技紒崓烧晲亯招伖叫佸曅佪パ蓞莞皝吿伣榿亝褉竵]衼选攣蓵崶隶暪衼崊竵褏瓟�(€€€伭請仚竵呝叆眳壉晑呅牂蜁睒皝呅鑱载肖€带両曂毡旭つ揉皝缮饺鴣�(€€€€€€€伇曅亝崓烧晲€魜蜁睒箙崓烧晳}呅肖(€€€€€€€仴榿蜁睒馆パ蓞莞€鴣厤嵣諘悂�(€€€€€€€€€€€伾曆丈竵扇�缮饺栝U箲暽櫛杰れ(€€€€€€€侓(€€€€€€€伒呇犺橥請崓烧晲皝蜁睒馆パ蓞莞�(€€€侓((€€€€技紒]衼选攣嵔寡蓞嵭佂靴卑仭奖懱仚饺佈ˉ虂脱蓵叴�(€€€伭請仚竵蓵祬スス湢櫷暠槫€带両曂毡旭つ揉皝缮饺鴣�(€€€€€€€伒呇犺橥請〉呇犺橥請⊥暠樄憰两庭褧惏佂暠樄荪选懮呡袱佂暠樄蓵櫿箲晲�(€€€侓((€€€€技紒]选暼佈佂焉晠磥虂墪暩亶吂崟北晲�(€€€€技�(€€€€技紒Q伇晬鍗睌仴虂墺箙射亝箰伣箶递呬皝图仴衼ヌ伒綉暠睍悂変佈(€€€€技紒亶吂崟北晳}呇€佈サ曂褏道€≥ˉ崰亝崓烧叞伖晻懱亝瑰輩浃伾呇葋选吀亜(€€€€技紒丮褏褧€仌拐磥饱瓟仌蛵山軡谈丮晹€�1晬鍗睌伒綉暠ス湀仴竵MA沟惛(€€€伭請仚竵ネ}崊箥暠睍悹櫷暠槫€带亯浇皝�(€€€€€€€佂暠樄崊箥暠睍憓呅攻蛚徒禂牑(€€€侓((€€€€技紒Q亼晬眳蓵悂土吀仴竵蜁嵔箲谈(€€€伭請仚竵懻蓞靴礁牂蜁睒带佋匦侅(€€€€€€€佂暠樄脱嚼雇呇丈呇ス潁驼垺蜁睒雇褏尚�(€€€侓)�(
- main
+mod conservation_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One step of a random valid-or-invalid call sequence. Invalid calls are
+    /// included on purpose: a rejected call must roll back and leave the
+    /// conservation invariant untouched just as a valid one does.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Advance(u64),
+        WithdrawAll,
+        WithdrawSome(i128),
+        TopUp(i128),
+        Extend(u64),
+        Cancel,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (1u64..=2_000).prop_map(Op::Advance),
+            Just(Op::WithdrawAll),
+            (-5i128..=500).prop_map(Op::WithdrawSome),
+            (0i128..=500).prop_map(Op::TopUp),
+            (0u64..=2_000).prop_map(Op::Extend),
+            Just(Op::Cancel),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The stream's conservation invariant
+        /// `withdrawn + refunded + remaining == deposited` holds after every
+        /// call of an arbitrary sequence of withdraw / cancel / top_up /
+        /// extend calls, and the contract's real token balance always equals
+        /// `remaining`.
+        #[test]
+        fn conservation_holds_after_any_call_sequence(
+            rate in 1i128..=1_000,
+            span in 1u64..=1_000,
+            ops in proptest::collection::vec(op_strategy(), 1..=24),
+        ) {
+            let start = 1_000_000u64;
+            let stop = start + span;
+            let te = TestEnv::at(start);
+            let (token, sender) = te.make_token(1_000_000_000_000_000);
+            let token_address = token.address.clone();
+            let recipient = te.make_address();
+            let env = te.env().clone();
+
+            let client = StreamContractClient::new(&env, &env.register(StreamContract, ()));
+            client.create(
+                &sender,
+                &recipient,
+                &token_address,
+                &rate,
+                &start,
+                &stop,
+                &true,
+            );
+
+            for op in ops {
+                match op {
+                    Op::Advance(delta) => {
+                        te.advance_to(te.timestamp().saturating_add(delta));
+                    }
+                    Op::WithdrawAll => {
+                        let _ = client.try_withdraw(&None);
+                    }
+                    Op::WithdrawSome(amount) => {
+                        let _ = client.try_withdraw(&Some(amount));
+                    }
+                    Op::TopUp(periods) => {
+                        let _ = client.try_top_up(&periods.saturating_mul(rate));
+                    }
+                    Op::Extend(extra) => {
+                        let current_stop = client.get().stop;
+                        let _ = client.try_extend(&current_stop.saturating_add(extra));
+                    }
+                    Op::Cancel => {
+                        let _ = client.try_cancel();
+                    }
+                }
+
+                let s = client.get();
+                let remaining = client.remaining();
+                prop_assert!(
+                    s.withdrawn >= 0 && s.refunded >= 0 && remaining >= 0,
+                    "negative component after {:?}: {:?}", op, s
+                );
+                prop_assert_eq!(
+                    s.withdrawn + s.refunded + remaining,
+                    s.deposited,
+                    "conservation violated after {:?}: {:?}", op, s
+                );
+                prop_assert_eq!(
+                    token.balance(&client.address),
+                    remaining,
+                    "held balance diverged after {:?}: {:?}", op, s
+                );
+            }
+        }
+    }
+}

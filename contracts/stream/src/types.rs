@@ -42,21 +42,27 @@ pub struct Stream {
     pub recipient: Address,
     /// The token being streamed.
     pub token: Address,
-    /// Tokens accrued per second, in the token's smallest unit.
+    /// Tokens accrued per second, in the token's smallest unit (e.g., stroops
+    /// for XLM, or the base unit defined by the token's decimals).
     pub rate_per_second: i128,
-    /// Ledger timestamp at which accrual begins.
+    /// Ledger timestamp at which accrual begins, in seconds since the Unix
+    /// epoch.
     pub start: u64,
-    /// Ledger timestamp at which accrual ends.
+    /// Ledger timestamp at which accrual ends, in seconds since the Unix
+    /// epoch.
     pub stop: u64,
     /// Whether the sender may cancel before `stop`.
     pub cancellable: bool,
-    /// Total ever pulled from the sender. Always `rate * (stop - start)`.
+    /// Total ever pulled from the sender, in the token's smallest unit. Always
+    /// `rate_per_second * (stop - start)`.
     pub deposited: i128,
-    /// Total ever paid out to the recipient.
+    /// Total ever paid out to the recipient, in the token's smallest unit.
     pub withdrawn: i128,
-    /// Total ever returned to the sender on cancellation.
+    /// Total ever returned to the sender on cancellation, in the token's
+    /// smallest unit.
     pub refunded: i128,
-    /// When the stream was cancelled, if it was. Accrual stops here.
+    /// When the stream was cancelled, if it was, in seconds since the Unix
+    /// epoch. Accrual stops here.
     pub cancelled_at: Option<u64>,
 }
 
@@ -84,7 +90,11 @@ impl Stream {
 
     /// Accrued but not yet withdrawn, as of `at`. What the recipient can take.
     pub fn available_at(&self, at: u64) -> Result<i128, Error> {
-        math::sub(self.accrued_at(at)?, self.withdrawn)
+        let accrued = self.accrued_at(at)?;
+        if self.withdrawn > accrued {
+            return Err(Error::Underflow);
+        }
+        math::sub(accrued, self.withdrawn)
     }
 
     /// What the contract still holds for this stream.
@@ -104,5 +114,52 @@ impl Stream {
     /// The declared span in seconds.
     pub fn duration(&self) -> u64 {
         self.stop.saturating_sub(self.start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use sororail_common::Error;
+
+    use super::Stream;
+
+    /// A bare struct for testing in isolation, with no contract or ledger.
+    fn bare(env: &Env) -> Stream {
+        Stream {
+            sender: Address::generate(env),
+            recipient: Address::generate(env),
+            token: Address::generate(env),
+            rate_per_second: 100,
+            start: 1_000_000,
+            stop: 1_001_000,
+            cancellable: true,
+            deposited: 100 * 1_000,
+            withdrawn: 0,
+            refunded: 0,
+            cancelled_at: None,
+        }
+    }
+
+    /// Documents that `available_at` degrades to `Err(Underflow)` if `withdrawn`
+    /// ever exceeds accrued (e.g. a future code path bug) rather than wrapping
+    /// to a negative `i128`. Today's `withdraw` rejects `requested > available`,
+    /// so this state is unreachable through the contract entry points; the pure
+    /// helper must still error. Mirrors
+    /// `available_at_errors_if_withdrawn_exceeds_accrued` in `test.rs` (#248).
+    #[test]
+    fn available_at_errors_if_withdrawn_exceeds_accrued() {
+        let env = Env::default();
+        let mut s = bare(&env);
+        // Accrued at start+10 is rate_per_second*10; force withdrawn past that.
+        s.withdrawn = s.rate_per_second * 10 + 1;
+        assert_eq!(
+            s.available_at(s.start + 10),
+            Err(Error::Underflow),
+            "available_at must error rather than wrap when withdrawn > accrued"
+        );
+        // Even after full accrual, an over-withdrawn book still errors.
+        s.withdrawn = s.deposited + 1;
+        assert_eq!(s.available_at(s.stop), Err(Error::Underflow));
     }
 }

@@ -20,6 +20,10 @@ impl BatchPayoutContract {
     /// The whole batch is validated and totalled **before** any money moves,
     /// so an invalid line is rejected without a partial payout ever being
     /// attempted.
+    ///
+    /// Paying the funder's own address is intentionally permitted. Such a
+    /// line counts toward the receipt total but transfers no net funds;
+    /// only transfers to this contract's own address are rejected.
     pub fn execute(
         env: Env,
         funder: Address,
@@ -58,8 +62,10 @@ impl BatchPayoutContract {
 
     /// Pays every recipient the same amount, in one transaction.
     ///
-    /// The common payroll shape, and cheaper to submit than [`Self::execute`]
+    /// The common payroll shape, and cheaper to submit than `execute`
     /// because the amount crosses the wire once rather than once per line.
+    /// The funder may appear among recipients, including more than once;
+    /// those self-payments count in the receipt but have no net balance effect.
     pub fn execute_equal(
         env: Env,
         funder: Address,
@@ -108,7 +114,7 @@ impl BatchPayoutContract {
 
     /// Totals a batch without moving anything, for a pre-signature preview.
     ///
-    /// Runs exactly the validation [`Self::execute`] does, so a preview that
+    /// Runs exactly the validation `execute` does, so a preview that
     /// succeeds means the batch itself will not be rejected for size, an
     /// invalid amount, or an overflowing total.
     pub fn preview(env: Env, recipients: Vec<Payment>) -> Result<Receipt, Error> {

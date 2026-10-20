@@ -33,6 +33,7 @@ or renumbers a variant in `errors.rs`.
 | 24 | `EscrowNotDisputed` | escrow | `resolve` called on an escrow that is not in `Disputed`. |
 | 25 | `EscrowAlreadyDisputed` | escrow | `dispute` called on an escrow that is already disputed. |
 | 26 | `EscrowNotCancellable` | escrow | `cancel` called on an escrow that is not in `Created`. |
+| 27 | `EscrowArbiterNotNeutral` | escrow | `init` configured an arbiter equal to the depositor or beneficiary. |
 | 40 | `StreamNotFound` | stream | No stream exists for the given id. |
 | 41 | `StreamCancelled` | stream | The stream has already been cancelled. |
 | 42 | `StreamNotCancellable` | stream | `cancel` called on a stream created with `cancellable = false`. |
@@ -44,6 +45,7 @@ or renumbers a variant in `errors.rs`.
 | 63 | `VestingRevoked` | vesting | The grant has already been revoked. |
 | 64 | `VestingCliffAfterEnd` | vesting | The cliff falls after the end of the vesting period. |
 | 65 | `VestingNothingToClaim` | vesting | Nothing vested-but-unclaimed remains to claim. |
+| 66 | `VestingScheduleOverflow` | vesting | `start + duration` would overflow `u64`. |
 | 80 | `RecurringNotFound` | recurring | No authorization exists for the given id. |
 | 81 | `RecurringCancelled` | recurring | The authorization has been cancelled. |
 | 82 | `RecurringPeriodNotElapsed` | recurring | `charge` called before `next_chargeable_at` (including the first charge). |

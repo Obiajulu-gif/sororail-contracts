@@ -144,7 +144,8 @@ Funds held by the contract, released on a condition.
 - `release(caller)` — beneficiary receives; callable by depositor or arbiter
 - `refund(caller)` — callable by depositor after deadline, or by arbiter at any time. If in `Disputed` state, callable by anyone after 7 days past the original deadline to recover from an unresponsive arbiter.
 - `dispute(caller)` / `resolve(split_bps)` — arbiter splits between parties; `split_bps` is the beneficiary's share
-- `dispute` requires a configured arbiter and errors otherwise, so `Disputed` is never reachable without one; `resolve` re-checks independently as defense-in-depth.
+- `dispute` requires a configured arbiter; calling it without one returns `EscrowNoArbiter`, so `Disputed` is never reachable without an arbiter. `resolve` re-checks independently as defense-in-depth.
+- Calling `dispute` on an escrow that is already in `Disputed` state returns `EscrowAlreadyDisputed`. Once disputed, a second `dispute` call is rejected so the arbiter cannot be overridden mid-resolution.
 - `fund` requires `deadline` not to have passed (inclusive); past it, it errors with a dedicated `DeadlinePassed` rather than the generic `EscrowClosed`, since the escrow is still `Created`, not terminal.
 - States: `Created → Funded → (Released | Refunded | Disputed → Resolved)`. Illegal transitions must error, not panic.
 - **Dispute timeout:** Once the deadline passes, an unresolved dispute has a 7-day grace period. After this period, either party (or anyone) may refund to recover funds from an unresponsive arbiter. This is a safety mechanism, not a normal flow.
@@ -236,6 +237,40 @@ The rule is set by how many parties may call an entry point:
 | `batch_payout` | `execute`, `execute_equal` (funder)                           | —                                                                                |
 
 A `caller` argument exists only when the contract cannot otherwise know who is acting. It also records who acted in the emitted event (`released_by`, `refunded_by`, `raised_by`, `cancelled_by`). This is why `Unauthorized` appears only in the `escrow` and `recurring` error tables. Each contract's `errors.rs` explains why the variants it never returns are absent. The contributor-facing rules for picking a pattern are in [CONTRIBUTING.md](CONTRIBUTING.md#choosing-an-authorization-pattern).
+
+#### Authorization model, by entry point
+
+Every public function, and which address(es) may call it. "—" means the function is a read-only view with no authorization check at all.
+
+| Contract       | Function               | May call it                                                    |
+| -------------- | ----------------------- | --------------------------------------------------------------- |
+| `escrow`       | `init`                  | depositor                                                       |
+| `escrow`       | `cancel`                | depositor                                                       |
+| `escrow`       | `fund`                  | depositor                                                       |
+| `escrow`       | `release`               | depositor or arbiter                                            |
+| `escrow`       | `refund`                | depositor or arbiter (anyone, after the dispute grace period)   |
+| `escrow`       | `dispute`               | depositor or beneficiary                                        |
+| `escrow`       | `resolve`               | arbiter                                                         |
+| `escrow`       | `state`, `bump`, `get`  | —                                                                |
+| `stream`       | `create`                | sender                                                          |
+| `stream`       | `withdraw`              | recipient                                                       |
+| `stream`       | `cancel`                | sender                                                          |
+| `stream`       | `top_up`                | sender                                                          |
+| `stream`       | `extend`                | sender                                                          |
+| `stream`       | `balance_of`, `remaining`, `bump`, `get` | —                                               |
+| `vesting`      | `create`                | grantor                                                         |
+| `vesting`      | `claim`                 | beneficiary                                                     |
+| `vesting`      | `revoke`                | grantor                                                         |
+| `vesting`      | `vested_amount`, `claimable`, `schedule`, `remaining`, `bump`, `get` | —                      |
+| `recurring`    | `authorize`             | payer                                                           |
+| `recurring`    | `charge`                | payee                                                            |
+| `recurring`    | `cancel`                | payer or payee                                                  |
+| `recurring`    | `next_chargeable_at`, `is_chargeable`, `remaining_periods`, `bump`, `get` | —            |
+| `batch_payout` | `execute`               | funder                                                          |
+| `batch_payout` | `execute_equal`         | funder                                                          |
+| `batch_payout` | `max_recipients`, `preview` | —                                                           |
+
+A wrong caller on a privileged function above gets either an authorization failure from the host (single fixed party) or `Error::Unauthorized` (several permitted parties) — see the caller-vs-`require_auth` rule just above.
 
 #### Lifecycle modeling: explicit `State` enum vs. optional timestamps
 

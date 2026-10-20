@@ -4,13 +4,8 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
- test/consolidate-contract-helpers-and-stable-ids
-    token::TokenClient,
-    vec, Address, Env, Vec,
-
     token::{StellarAssetClient, TokenClient},
     vec, Address, Env, Event, Vec,
- main
 };
 use sororail_common::{testutils::TestEnv, Error};
 
@@ -90,6 +85,10 @@ fn execute_pays_each_recipient_their_own_amount() {
     ];
 
     let receipt = f.client.execute(&f.funder, &f.token.address, &batch);
+    // Capture immediately: subsequent token balance invocations replace the
+    // events returned by `events().all()`.
+    let all = f.env.events().all();
+    let events = all.events();
     assert_eq!(
         receipt,
         Receipt {
@@ -106,8 +105,6 @@ fn execute_pays_each_recipient_their_own_amount() {
 
     // `execute` emits one token transfer per recipient before its own
     // `Executed`, so take the last event rather than assuming an index.
-    let all = f.env.events().all();
-    let events = all.events();
     let executed_event = events.last().expect("no events emitted");
     let expected = Executed {
         funder: f.funder.clone(),
@@ -116,6 +113,46 @@ fn execute_pays_each_recipient_their_own_amount() {
         total: 357,
     };
     assert_eq!(executed_event, &expected.to_xdr(&f.env, &f.client.address));
+}
+
+#[test]
+fn execute_emits_the_total_and_recipient_count() {
+    let f = Fixture::new();
+    let recipients = f.addresses(2);
+    let payments = vec![
+        &f.env,
+        Payment {
+            to: recipients.get(0).unwrap(),
+            amount: 125,
+        },
+        Payment {
+            to: recipients.get(1).unwrap(),
+            amount: 875,
+        },
+    ];
+
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
+    let expected = Executed {
+        funder: f.funder,
+        token: f.token.address,
+        count: 2,
+        total: 1_000,
+    };
+    assert_eq!(
+        f.env.events().all().last().unwrap(),
+        expected.to_xdr(&f.env, &f.client.address)
+    );
+}
+
+#[test]
+fn execute_leaves_no_token_balance_on_the_contract() {
+    let f = Fixture::new();
+    let payments = f.payments(3, 37);
+
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
+    assert_eq!(f.token.balance(&f.client.address), 0);
 }
 
 #[test]
@@ -165,6 +202,49 @@ fn execute_rejects_non_positive_amounts_before_paying_anyone() {
         assert_eq!(f.token.balance(&good), 0);
         assert_eq!(f.token.balance(&f.funder), MINT);
     }
+}
+
+#[test]
+fn execute_rejects_a_zero_amount_payment_inside_a_larger_batch() {
+    // The other non-positive-amount test only uses a 2-line batch; this
+    // checks the same all-or-nothing validation holds with several valid
+    // lines around the bad one, not just a single good line next to it (#264).
+    let f = Fixture::new();
+    let recipients: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&f.env)).collect();
+    let mut batch = Vec::new(&f.env);
+    for (i, to) in recipients.iter().enumerate() {
+        batch.push_back(Payment {
+            to: to.clone(),
+            // The third of five payments is the zero amount.
+            amount: if i == 2 { 0 } else { 100 },
+        });
+    }
+
+    assert_eq!(
+        f.client.try_execute(&f.funder, &f.token.address, &batch),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // All-or-nothing: none of the four otherwise-valid lines were paid either.
+    for to in &recipients {
+        assert_eq!(f.token.balance(to), 0);
+    }
+    assert_eq!(f.token.balance(&f.funder), MINT);
+}
+
+#[test]
+fn preview_rejects_a_zero_amount_payment_inside_a_larger_batch() {
+    // `preview` runs the same validation as `execute` (#264); nothing to
+    // assert about balances since preview never moves funds.
+    let f = Fixture::new();
+    let mut batch = Vec::new(&f.env);
+    for i in 0..5 {
+        batch.push_back(Payment {
+            to: Address::generate(&f.env),
+            amount: if i == 2 { 0 } else { 100 },
+        });
+    }
+
+    assert_eq!(f.client.try_preview(&batch), Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
@@ -346,6 +426,27 @@ fn execute_equal_pays_everyone_the_same() {
 }
 
 #[test]
+fn execute_equal_applies_the_exact_amount_without_rounding() {
+    let f = Fixture::new();
+    let recipients = f.addresses(3);
+
+    let receipt = f
+        .client
+        .execute_equal(&f.funder, &f.token.address, &recipients, &7);
+
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 21
+        }
+    );
+    for recipient in recipients.iter() {
+        assert_eq!(f.token.balance(&recipient), 7);
+    }
+}
+
+#[test]
 fn execute_equal_rejects_a_non_positive_amount() {
     let f = Fixture::new();
     let recipients = f.addresses(3);
@@ -452,6 +553,51 @@ fn preview_totals_without_moving_anything() {
 }
 
 #[test]
+fn preview_returns_the_correct_receipt_and_moves_nothing() {
+    // The existing uniform-amount preview test can't catch a `Receipt` whose
+    // `total` happens to equal `count * amount` by coincidence; this uses
+    // distinct amounts so `count` and `total` are independently verified,
+    // and checks every balance plus the event log, not just the funder's
+    // (#265).
+    let f = Fixture::new();
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    let c = Address::generate(&f.env);
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: a.clone(),
+            amount: 11,
+        },
+        Payment {
+            to: b.clone(),
+            amount: 22,
+        },
+        Payment {
+            to: c.clone(),
+            amount: 33,
+        },
+    ];
+
+    let receipt = f.client.preview(&batch);
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 66
+        }
+    );
+
+    assert_eq!(f.token.balance(&a), 0);
+    assert_eq!(f.token.balance(&b), 0);
+    assert_eq!(f.token.balance(&c), 0);
+    assert_eq!(f.token.balance(&f.funder), MINT);
+    assert_eq!(f.token.balance(&f.client.address), 0);
+    // Unlike `execute`, `preview` never publishes an `Executed` event.
+    assert!(f.env.events().all().events().is_empty());
+}
+
+#[test]
 fn preview_rejects_exactly_what_execute_rejects() {
     let f = Fixture::new();
     let empty: Vec<Payment> = Vec::new(&f.env);
@@ -489,7 +635,7 @@ fn a_full_size_batch_executes() {
         .client
         .execute_equal(&f.funder, &f.token.address, &recipients, &10);
     assert_eq!(receipt.count, MAX_RECIPIENTS);
-    assert_eq!(receipt.total, 10 * MAX_RECIPIENTS as i128);
+    assert_eq!(receipt.total, 10 * i128::from(MAX_RECIPIENTS));
 }
 
 /// Largest batch that executes under the test environment's budget.

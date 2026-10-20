@@ -111,6 +111,8 @@ pub enum Error {
     EscrowAlreadyDisputed = 25,
     /// `cancel` called on an escrow that is not in `Created`.
     EscrowNotCancellable = 26,
+    /// `escrow::init` requires a neutral arbiter distinct from both participants.
+    EscrowArbiterNotNeutral = 27,
 
     // ----- stream: 40–59 -----
     /// Reserved for the future id-keyed stream design.

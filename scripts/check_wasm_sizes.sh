@@ -2,7 +2,7 @@
 set -euo pipefail
 
 directory="${1:-target/wasm32v1-none/release}"
-max_bytes="${WASM_MAX_BYTES:-262144}"
+max_bytes="${WASM_MAX_BYTES:-${MAX_WASM_BYTES:-262144}}"
 shopt -s nullglob
 files=("$directory"/sororail_*.wasm)
 if ((${#files[@]} == 0)); then
@@ -13,9 +13,10 @@ fi
 failed=0
 for file in "${files[@]}"; do
   size=$(stat -c%s "$file")
-  echo "$(basename "$file"): $size bytes (limit: $max_bytes)"
+  name=$(basename "$file")
+  echo "$name: $size bytes (limit: $max_bytes)"
   if ((size > max_bytes)); then
-    echo "${file} exceeds the ${max_bytes}-byte WASM limit" >&2
+    echo "::error file=$file::${name} is ${size} bytes, exceeds ${max_bytes} byte limit" >&2
     failed=1
   fi
 done
